@@ -1,0 +1,273 @@
+#For multiple beta values:
+
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from numba import njit
+from copy import deepcopy
+import networkx as nx
+import scipy.stats as stats
+from multiprocessing import Pool
+import seaborn as sns
+from itertools import chain
+
+
+def create_graph(connection_bias, num_nodes=600, hesitant_percentage=0.3):
+    """Create a graph with specified connection bias and assortativity."""
+    hesitant_count = int(num_nodes * hesitant_percentage)
+    non_hesitant_count = num_nodes - hesitant_count
+    types = np.array(["hesitant"] * hesitant_count + ["non_hesitant"] * non_hesitant_count)
+    np.random.shuffle(types)
+
+    p_diff = (10 / connection_bias) / num_nodes
+    p_hh = (10 - non_hesitant_count * p_diff) / hesitant_count
+    p_nn = (10 - hesitant_count * p_diff) / non_hesitant_count
+
+    # Assuming `types` is a NumPy array for efficient comparison
+    types = np.array(types)  # Ensure types is a NumPy array
+
+    # Create a random matrix of probabilities
+    rand_probs = np.random.rand(num_nodes, num_nodes)
+
+    # Create a boolean mask for pairs (i, j) where i < j (upper triangular part)
+    upper_tri_mask = np.triu(np.ones((num_nodes, num_nodes), dtype=bool), k=1)
+
+    # Pairwise type comparison
+    same_type = types[:, None] == types
+
+    # Assign probabilities based on type conditions
+    prob_matrix = np.full((num_nodes, num_nodes), p_diff)  # Default to `p_diff`
+    prob_matrix[(types[:, None] == "hesitant") & same_type] = p_hh
+    prob_matrix[(types[:, None] == "non_hesitant") & same_type] = p_nn
+
+    # Generate adjacency matrix
+    adj_matrix = (rand_probs < prob_matrix) & upper_tri_mask  # Apply probability threshold
+
+    # Make the matrix symmetric
+    adj_matrix = adj_matrix | adj_matrix.T
+
+    # Convert to a NetworkX graph
+    G = nx.from_numpy_array(adj_matrix.astype(int))
+    for node in G.nodes():
+        G.nodes[node]['type'] = 1 if types[node] == "hesitant" else 0
+
+    assortativity = nx.attribute_assortativity_coefficient(G, 'type')
+    return G, assortativity
+
+def simulate_one_run(params):
+    num_nodes = params['N']
+    connection_bias = params['connection_bias']
+    initial_infected_number = params['initial_infected_number']
+    dt = params['dt']
+    time = params['time']
+    time_steps = time/dt
+    gamma = params['gamma']
+    avg_connectivity = params['avg_connectivity']
+    beta = params['beta']
+    vaccine_effectiveness = params['sigma']
+    frac_vaccpos = params['frac_vaccpos']
+    hesitant_percentage = 1 - frac_vaccpos
+    p_vax = params['p_vax']
+    p_mutation = params['p_mutation']
+    contacts_per_infected = params['contacts_per_infected']
+    var2_outbreak_threshold = params['var2_outbreak_threshold']
+    var2_outbreak_time_threshold = params['var2_outbreak_time_threshold']
+    var2_outbreaks = 0
+
+    S_t = []
+    I1_t = []
+    I2_t = []
+    R1_t = []
+    R2_t = []
+    times = []
+
+    G, assortativity = create_graph(connection_bias, num_nodes, hesitant_percentage=hesitant_percentage)
+
+    S = np.ones(num_nodes)
+    I1 = np.zeros(num_nodes)  # First strain
+    R1 = np.zeros(num_nodes)
+    V = np.zeros(num_nodes)
+  
+    # initial_infected_nodes = np.random.choice(np.arange(num_nodes), initial_infected_number, replace=False)
+    # I1[initial_infected_nodes] = 1
+    # S[initial_infected_nodes] = 0
+
+    ## Vaccinate people before simulation starts
+    susceptible_nodes = np.where(S == 1)[0]
+    if len(susceptible_nodes) > 0:
+        for i in susceptible_nodes:
+            if G.nodes[i]['type'] == 0 and np.random.rand() < p_vax:
+                S[i] = 0
+                V[i] = 1
+    
+    # Seed exactly one initially infected person from the hesitant group
+    hesitant_indices = np.where((V == 0) & (S == 1))[0]
+    if len(hesitant_indices) > 0:
+        initial_infected = np.random.choice(hesitant_indices)
+        I1[initial_infected] = 1
+        S[initial_infected] = 0
+
+    # -------------------------
+    # Simulation Loop
+    # -------------------------
+    I_history = []
+    t = 0
+    while t < time_steps and np.sum(I1) > 0:
+        infected_nodes_var_1 = np.where(I1 == 1)[0]
+        for i in infected_nodes_var_1:
+            if I1[i] == 1:
+                ## Choose infected person's contacts
+                neighbors = list(G.neighbors(i))  # Get the neighbors of i
+                if len(neighbors) > contacts_per_infected:
+                    contacts = np.random.choice(neighbors, contacts_per_infected, replace=False)  # Choose random contacts
+                else:
+                    contacts = neighbors  # If not enough, take all
+                ## Infect the contacts
+                for contact in contacts:
+                    if S[contact] == 1:
+                        if random.random() < beta * dt: 
+                            I1[contact] = 1
+                            S[contact] = 0
+                    elif (R1[contact] == 1 or V[contact] == 1) and (I1[contact]) == 0:
+                        effective_beta = (1.0 - vaccine_effectiveness) * beta
+                        if random.random() < effective_beta * dt:
+                            R1[contact] = 0
+                            I1[contact] = 1
+                
+        ## Recoveries
+        for i in infected_nodes_var_1:
+            if random.random() < gamma * dt:
+                I1[i] = 0
+                R1[i] = 1
+        
+        I_history.append(np.sum(I1))  
+        t += 1
+
+    
+    # time_of_peak_infection = np.argmax(i_over_time)
+    percent_considered_outbreak = 0.01
+    # outbreak_occurred_var_1 = total_infected_var_1 > (percent_considered_outbreak * num_nodes)
+    # outbreak_occurred_var_2 = total_infected_var_2 > (percent_considered_outbreak * num_nodes)
+    # outbreak_occurred = total_infected > (percent_considered_outbreak * num_nodes)
+
+    peak_infected = max(I_history)
+    outbreak = peak_infected >= (percent_considered_outbreak * num_nodes)
+    I_eq = I_history[-1]  # Equilibrium number after timestep 100
+    return I_eq, outbreak
+
+
+def run_simulations_for_beta(params, num_simulations=200, max_workers=20):
+    """
+    Runs multiple simulation realizations in parallel for a given beta.
+    Returns:
+        results (list of tuples): Each tuple is (peak_infected, outbreak).
+    """
+    results = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(simulate_one_run, params) for _ in range(num_simulations)]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
+
+def main():
+
+    # Define a structured array type for parameters
+    param_dtype = np.dtype([
+        ('beta', np.float64),
+        ('connection_bias', np.float64),
+        ('sigma', np.float64),
+        ('gamma', np.float64),
+        ('N', np.int64),
+        ('p_mutation', np.float64),
+        ('initial_infected_number', np.int64),
+        ('dt', np.float64),
+        ('time', np.float64),
+        ('avg_connectivity', np.float64),
+        ('frac_vaccpos', np.float64),
+        ('p_vax', np.float64),
+        ('contacts_per_infected', np.int64),
+        ('var2_outbreak_threshold', np.float64),
+        ('var2_outbreak_time_threshold', np.float64),
+    ])
+
+    params = np.zeros(1, dtype=param_dtype)[0]
+
+    params["beta"] = 0.8
+    params["gamma"] = 0.2
+    params["N"] = 3000
+    params["p_mutation"] = 0
+    # params["p_mutation"] = 0.05
+
+    params["initial_infected_number"] = 1
+    params["dt"] = 0.5
+    params["time"] = 200
+    params["avg_connectivity"] = 10
+    params["p_vax"] = 1
+    params["frac_vaccpos"] = 0.7
+    params["contacts_per_infected"] = 1
+    params["var2_outbreak_threshold"] = 0.01 * params["N"]
+    params["var2_outbreak_time_threshold"] = params["time"] * params["dt"]
+
+
+    n_sims = 200
+
+    params["connection_bias"] = 1
+    a_1 = params["connection_bias"]
+
+    # outbreak_probabilities_1 = []
+    outbreak_sizes_1 = []
+    outbreak_sizes_2 = []
+
+    sigmas = np.arange(0.01, 1.01, 0.05)
+
+    # Loop over each sigma value.
+    for sigma in sigmas:
+        params_loc = deepcopy(params)
+        params_loc['sigma'] = sigma
+        results = run_simulations_for_beta(params_loc, num_simulations=n_sims, max_workers=8)
+        #outbreak_flags = [res[1] for res in results]
+        #fraction_outbreak = sum(outbreak_flags) / len(outbreak_flags)
+        #outbreak_probabilities_1.append(fraction_outbreak)
+        outbreak_sizes_1.append(np.mean([res[0] for res in results]))
+        print(f"sigma = {sigma:.2f} -> Outbreak size: {np.mean([res[0] for res in results]):.3f}")
+
+
+        # -------------------------
+    # Plotting the Results 1 # recall that the sigma parameter controls the strength of immunity (vaccinated/recovered)
+    # -------------------------
+    params["connection_bias"] = 90
+    a_2 = params["connection_bias"]
+
+    outbreak_probabilities_2 = []
+
+    # Loop over each sigma value.
+    for sigma in sigmas:
+        params_loc = deepcopy(params)
+        params_loc['sigma'] = sigma
+        results = run_simulations_for_beta(params_loc, num_simulations=n_sims, max_workers=25)
+        #outbreak_flags = [res[1] for res in results]
+        #fraction_outbreak = sum(outbreak_flags) / len(outbreak_flags)
+        #outbreak_probabilities_1.append(fraction_outbreak)
+        outbreak_sizes_2.append(np.mean([res[0] for res in results]))
+        print(f"sigma = {sigma:.2f} -> Outbreak size: {np.mean([res[0] for res in results]):.3f}")
+        
+    # -------------------------
+    # Plotting the Results 2 # recall that the sigma parameter controls the strength of immunity (vaccinated/recovered)
+    # -------------------------
+    plt.figure(figsize=(8, 5))
+    plt.plot(np.array(sigmas), outbreak_sizes_1, marker='o', linestyle='-', label=f"Assortativity low ({a_1})")
+    plt.plot(np.array(sigmas), outbreak_sizes_2, marker='o', linestyle='-', label=f"Assortativity high ({a_2})")
+    #plt.plot(np.array(betas)/params["gamma"], outbreak_probabilities_2, marker='o', linestyle='-', label=f"Assortativity low")
+    plt.xlabel(r"$\sigma$ (strength of immunity)")
+    plt.ylabel("Outbreak size at equilibrium")
+    plt.grid(True)
+    #plt.ylim([-0.01, 1.02])
+    plt.legend()
+    plt.show()
+
+
+    
+if __name__ == "__main__":
+    main()
+
